@@ -1,0 +1,29 @@
+<!doctype html>
+<!--
+  SYNTHETIC FIXTURE - hand-written for parser testing, not a real saved Amazon page.
+  Intended requested ASIN: B0FIX00002. Canonical link deliberately names a DIFFERENT
+  ASIN (B0CANON001) -> exercises the redirect path. Per PLAN.md section 9, a redirect
+  is recorded, not auto-followed - the parser must stop at the canonical check and not
+  attempt to extract merchant/delivery fields from this page.
+  See fixtures/README.md.
+-->
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <title>Fixture Sample Product Two - Amazon AU (synthetic fixture)</title>
+  <link rel="canonical" href="https://www.amazon.com.au/dp/B0CANON001"/>
+</head>
+<body>
+  <div id="availability">
+    <span class="a-size-medium a-color-success">In stock.</span>
+  </div>
+
+  <div id="merchantInfoFeature_feature_div" class="offer-display-feature-text">
+    Sold by <a id="sellerProfileTriggerId" href="/sp?seller=FIXTURE2">Fixture Seller Pty Ltd</a>
+  </div>
+
+  <div id="deliveryBlockMessage">
+    FREE delivery Friday, 21 August.
+  </div>
+</body>
+</html>

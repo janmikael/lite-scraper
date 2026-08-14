@@ -1,0 +1,31 @@
+<!doctype html>
+<!--
+  SYNTHETIC FIXTURE - hand-written for parser testing, not a real saved Amazon page.
+  Intended requested ASIN: B0FIX00001 (canonical matches -> no redirect).
+  Exercises: sold_by, ships_from, FREE delivery (fee=0), ETA within 14 days -> extracted.
+  See fixtures/README.md.
+-->
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <title>Fixture Sample Product One - Amazon AU (synthetic fixture)</title>
+  <link rel="canonical" href="https://www.amazon.com.au/dp/B0FIX00001"/>
+</head>
+<body>
+  <div id="availability">
+    <span class="a-size-medium a-color-success">In stock.</span>
+  </div>
+
+  <div id="merchantInfoFeature_feature_div" class="offer-display-feature-text">
+    Sold by <a id="sellerProfileTriggerId" href="/sp?seller=FIXTURE1">Fixture Seller Pty Ltd</a>
+  </div>
+
+  <div id="fulfillerInfoFeature_feature_div" class="offer-display-feature-text">
+    Ships from Amazon AU
+  </div>
+
+  <div id="deliveryBlockMessage">
+    FREE delivery <b>Wednesday, 12 August</b>. Order within 3 hrs 20 mins.
+  </div>
+</body>
+</html>

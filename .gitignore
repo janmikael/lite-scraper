@@ -1,0 +1,19 @@
+# Run output - regenerated every run, never source
+runs/
+results/
+
+# Fetched page HTML. Never committed: large, and a cached page is a stale
+# snapshot (delivery ETAs change daily).
+page_cache/
+rendered_cache/
+debug_failures/
+*.html.gz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store

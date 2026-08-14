@@ -1,0 +1,24 @@
+<!doctype html>
+<!--
+  SYNTHETIC FIXTURE - hand-written for parser testing, not a real saved Amazon page.
+  Intended requested ASIN: B0FIX00003 (canonical matches -> no redirect).
+  Deliberately has NO merchant/delivery block at all -> exercises the no_required_data
+  path: page fetched fine, nothing usable found.
+  See fixtures/README.md.
+-->
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <title>Fixture Sample Product Three - Amazon AU (synthetic fixture)</title>
+  <link rel="canonical" href="https://www.amazon.com.au/dp/B0FIX00003"/>
+</head>
+<body>
+  <div id="availability">
+    <span class="a-color-base">Currently unavailable.</span>
+  </div>
+  <p>
+    This synthetic fixture intentionally has no sold_by, ships_from, or delivery block,
+    to exercise the no_required_data routing path.
+  </p>
+</body>
+</html>
