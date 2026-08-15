@@ -696,10 +696,51 @@ _LIVE_REQUEST_HEADERS = {
 # product request reuses it, so the AU context costs ONE extra request per run,
 # not one per ASIN.
 _COOKIE_JAR = http.cookiejar.CookieJar()
+
+# Default: no proxy at all, regardless of http_proxy/https_proxy in the env.
+# configure_proxy() swaps this for a proxied opener when one is supplied.
 _NO_PROXY_OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}),
     urllib.request.HTTPCookieProcessor(_COOKIE_JAR),
 )
+
+# Set once at startup. Kept module-level so every request path (AU location
+# setup and product fetches alike) goes through the same proxy and the same
+# cookie jar - a split would put the delivery-location cookie on one exit IP
+# and the product request on another, which Amazon treats as a new visitor.
+PROXY_STATE = {"configured": False, "host": None}
+
+
+def _scrub_proxy_secrets(text):
+    """Never let proxy credentials reach a log, a CSV, or the console."""
+    return re.sub(r"//[^/@\s]*:[^/@\s]*@", "//***:***@", str(text))
+
+
+def configure_proxy(proxy_url, log):
+    """Route all HTTP through proxy_url (http://user:pass@host:port).
+
+    Amazon throttles by IP reputation - a datacenter/residential-flagged address
+    gets served a 'Server Busy' stub instead of the product page. A residential
+    AU exit both lifts that and puts the delivery context in Australia.
+
+    Returns True when a proxy is active. Credentials are read from the
+    environment or CLI and are never written to disk or logged in the clear.
+    """
+    global _NO_PROXY_OPENER
+    if not proxy_url:
+        return False
+    parsed = urllib.parse.urlsplit(proxy_url)
+    if not parsed.hostname:
+        raise SystemExit("--proxy must look like http://user:pass@host:port (got %r)"
+                         % _scrub_proxy_secrets(proxy_url))
+    _NO_PROXY_OPENER = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}),
+        urllib.request.HTTPCookieProcessor(_COOKIE_JAR),
+    )
+    PROXY_STATE["configured"] = True
+    PROXY_STATE["host"] = "%s:%s" % (parsed.hostname, parsed.port or "?")
+    log("proxy ENABLED via %s (credentials hidden)" % PROXY_STATE["host"])
+    return True
 
 _GLOW_TOKEN_RE = re.compile(
     r'id="glowValidationToken"[^>]*value="([^"]+)"|'
@@ -804,17 +845,27 @@ def _short_reason(value):
 
 
 def fetch_live_html(url, timeout_s):
-    """Single direct GET, no proxy, no retries. Returns (html_text, error) where
-    exactly one is None. error is a short machine-readable string for the
-    errors-sheet reason column: "http_status_<code>" or "fetch_failed:<reason>".
+    """Single direct GET, no retries. Returns (html_text, error) where exactly
+    one is None. error is a short machine-readable string for the errors-sheet
+    reason column: "http_status_<code>", "proxy_auth_failed", or
+    "fetch_failed:<reason>".
     """
     request = urllib.request.Request(url, headers=_LIVE_REQUEST_HEADERS)
     try:
         response = _NO_PROXY_OPENER.open(request, timeout=timeout_s)
     except urllib.error.HTTPError as exc:
+        # 407 means the proxy rejected our credentials. Retrying cannot help,
+        # and a retry loop on this exact fault is what turned an outage into
+        # ~263k wasted proxy connections in the previous system. Surface it as
+        # its own status so the run can stop instead of grinding.
+        if exc.code == 407:
+            return None, "proxy_auth_failed"
         return None, "http_status_%d" % exc.code
     except urllib.error.URLError as exc:
-        return None, "fetch_failed:%s" % _short_reason(exc.reason)
+        reason = _scrub_proxy_secrets(_short_reason(exc.reason))
+        if "407" in reason or "proxy" in reason.lower():
+            return None, "proxy_auth_failed"
+        return None, "fetch_failed:%s" % reason
     except Exception as exc:
         return None, "fetch_failed:%s" % type(exc).__name__
 
@@ -1049,6 +1100,35 @@ def _retain_html(html_text, asin, result, cache_dir, retention, log):
     # caller's frame and is reclaimed normally.
 
 
+class RunAborted(Exception):
+    """A safety limit tripped. The batch stops; results so far are still written."""
+
+
+def _trip_if_unhealthy(live_state, live_cfg, log):
+    """Stop the batch when the run is clearly not working.
+
+    Without this a broken proxy or a block wave quietly burns the whole ASIN
+    list - the exact failure mode that ran for 10+ hours in the previous system.
+    Fail closed: stop and let a human look, never auto-resume.
+    """
+    done = live_state["fetches_done"]
+    blocked = live_state["blocked"]
+    auth_failed = live_state["proxy_auth_failures"]
+
+    if auth_failed >= live_cfg["max_proxy_auth_failures"]:
+        raise RunAborted("proxy rejected credentials %d times - check the proxy user/password"
+                         % auth_failed)
+
+    # Only judge the block rate once there is enough signal to judge it on.
+    if done >= live_cfg["block_rate_min_samples"]:
+        rate = blocked / float(done)
+        if rate >= live_cfg["max_block_rate"]:
+            raise RunAborted(
+                "%.0f%% of the last %d fetches were blocked by Amazon (limit %.0f%%) - "
+                "stopping so the rest of the list isn't wasted"
+                % (rate * 100, done, live_cfg["max_block_rate"] * 100))
+
+
 def classify(unit_key, fixtures_dir, cache_dir, live_cfg, live_state,
              rendered_cache_dir, browser_cfg, browser_state, log, retention=None):
     """Classification for one fetch unit (ASIN or SKU key).
@@ -1163,11 +1243,17 @@ def classify(unit_key, fixtures_dir, cache_dir, live_cfg, live_state,
 
         if error is not None:
             log("live fetch failed for %s: %s" % (unit_key, error))
+            if error == "proxy_auth_failed":
+                live_state["proxy_auth_failures"] += 1
+                _trip_if_unhealthy(live_state, live_cfg, log)
+                return {"status": "proxy_auth_failed", "reason": error}
             status = "not_found" if error == "http_status_404" else "fetch_failed"
             return {"status": status, "reason": error}
 
         if _looks_blocked_or_busy(html_text):
             log("live fetch for %s looks blocked/captcha/Server Busy" % unit_key)
+            live_state["blocked"] += 1
+            _trip_if_unhealthy(live_state, live_cfg, log)
             result = {"status": "server_busy", "reason": "blocked_or_captcha_or_server_busy"}
         else:
             # Parse straight from memory. The HTML is never written to disk on
@@ -1275,8 +1361,18 @@ def build_records(units, rejected, extracted_at, fixtures_dir, cache_dir, live_c
         records.append(rec)
 
     for key, member_rows in units.items():
-        result = classify(key, fixtures_dir, cache_dir, live_cfg, live_state,
-                          rendered_cache_dir, browser_cfg, browser_state, log, retention)
+        try:
+            result = classify(key, fixtures_dir, cache_dir, live_cfg, live_state,
+                              rendered_cache_dir, browser_cfg, browser_state, log, retention)
+        except RunAborted as exc:
+            # Stop fetching, but keep everything already extracted: the partial
+            # results are written normally and progress.jsonl lets --resume pick
+            # up from here once the cause is fixed.
+            log("ABORTED: %s" % exc)
+            log("stopping after %d fetches - results so far are still written"
+                % live_state.get("fetches_done", 0))
+            live_state["aborted"] = str(exc)
+            break
         for row in member_rows:
             rec = project_to_output(row, result, extracted_at)
             order[id(rec)] = row["input_row_number"]
@@ -1493,6 +1589,21 @@ def main(argv=None):
                         help="skip ASINs already completed in a previous run folder, using its "
                              "progress.jsonl. Lets a large batch continue after a crash without "
                              "re-fetching what already succeeded.")
+    parser.add_argument("--proxy", default=os.environ.get("SHIPPING_PROXY_URL"),
+                        help="route all requests through this proxy, e.g. "
+                             "http://user:pass@gate.decodo.com:7000 . Use an AU residential "
+                             "exit: it lifts Amazon's Server Busy throttling AND puts the "
+                             "delivery context in Australia. Defaults to $SHIPPING_PROXY_URL "
+                             "so credentials never need to appear on the command line or in "
+                             "this repo.")
+    parser.add_argument("--max-block-rate", type=float, default=0.30,
+                        help="abort the run if this fraction of fetches come back blocked "
+                             "(default: 0.30)")
+    parser.add_argument("--block-rate-min-samples", type=int, default=10,
+                        help="don't judge the block rate until this many fetches have run "
+                             "(default: 10)")
+    parser.add_argument("--max-proxy-auth-failures", type=int, default=3,
+                        help="abort after this many 407s from the proxy (default: 3)")
     parser.add_argument("--au-postcode", default="2000",
                         help="Australian delivery postcode to establish once per run, so ETA and "
                              "delivery fee are computed for Australia even when the tool runs "
@@ -1524,6 +1635,9 @@ def main(argv=None):
             "limit": args.limit if args.limit is not None else 5,
             "delay_seconds": args.delay_seconds,
             "timeout_seconds": args.timeout_seconds,
+            "max_block_rate": args.max_block_rate,
+            "block_rate_min_samples": args.block_rate_min_samples,
+            "max_proxy_auth_failures": args.max_proxy_auth_failures,
         }
 
     browser_cfg = None
@@ -1575,6 +1689,14 @@ def main(argv=None):
     log("run folder: %s" % run_dir)
     log("input: %s" % args.input)
     log("page cache: %s" % (cache_dir if cache_dir is not None else "(disabled, --mock-only)"))
+
+    # Must happen before ANY request, so the AU location cookie and the product
+    # fetches all leave from the same exit IP.
+    if args.proxy:
+        configure_proxy(args.proxy, log)
+    elif live_cfg is not None:
+        log("proxy: NONE - direct connection. If Amazon returns 'Server Busy' stubs, set "
+            "SHIPPING_PROXY_URL to an AU residential proxy.")
     log("rendered cache: %s" % (rendered_cache_dir if rendered_cache_dir is not None else "(disabled, --mock-only)"))
     if browser_cfg is not None:
         log("BROWSER MODE - headless-Chrome direct fetch enabled (%s). No proxy, no concurrency. "
@@ -1650,7 +1772,8 @@ def main(argv=None):
         log("HTML reuse: ENABLED - previously saved pages may be reparsed (ETAs may be stale)")
 
     extracted_at = started.replace(microsecond=0).isoformat()
-    live_state = {"fetches_done": 0, "wire_bytes": 0}
+    live_state = {"fetches_done": 0, "wire_bytes": 0, "blocked": 0,
+                  "proxy_auth_failures": 0, "aborted": None}
     browser_state = {"fetches_done": 0, "served_hosts": {}}
     progress_path = os.path.join(run_dir, "progress.jsonl")
     records = build_records(units, rejected, extracted_at, fixtures_dir, cache_dir, live_cfg, live_state,
@@ -1750,7 +1873,13 @@ def main(argv=None):
         ("target_asin", normalise_asin(args.asin) if args.asin else None),
         ("browser_binary", browser_cfg["chrome_binary"] if browser_cfg is not None else None),
         ("network_calls", live_state["fetches_done"] + browser_state["fetches_done"]),
-        ("proxy_used", False),
+        ("proxy_used", PROXY_STATE["configured"]),
+        ("proxy_endpoint", PROXY_STATE["host"]),
+        ("blocked_by_amazon", live_state["blocked"]),
+        ("proxy_auth_failures", live_state["proxy_auth_failures"]),
+        ("block_rate", round(live_state["blocked"] / live_state["fetches_done"], 3)
+         if live_state["fetches_done"] else None),
+        ("aborted_reason", live_state["aborted"]),
         ("decodo_used", False),
         ("db_writes", 0),
     ])

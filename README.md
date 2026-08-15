@@ -1,7 +1,8 @@
 # Shipping Enrichment Lite — how to run
 
 Standalone Amazon AU tool: **ASIN → delivery ETA + merchant + delivery fee.**
-No database, no scheduler, no proxy, no browser. One HTTP request per ASIN.
+No database, no scheduler, no browser. One HTTP request per ASIN.
+Needs an AU residential proxy (see §2b) — Amazon blocks direct connections.
 
 ## 1. Put your ASINs in `skus.csv`
 
@@ -45,8 +46,39 @@ by accident.
 | `--failure-cache-max N` | 50 | Cap on saved failure pages. `0` disables. |
 | `--debug-cache` | off | DEV ONLY: keep every page's HTML. Huge on big batches. |
 | `--use-cache` | off | Reuse previously saved HTML instead of fetching (stale ETAs). |
+| `--proxy URL` | `$SHIPPING_PROXY_URL` | Route via proxy. Needed — see §2b. |
+| `--max-block-rate N` | 0.30 | Abort if this share of fetches are blocked. |
+| `--max-proxy-auth-failures N` | 3 | Abort after this many proxy 407s. |
 
 Start small (`--limit 10`), confirm the output looks right, then raise it.
+
+## 2b. Proxy (needed — Amazon blocks direct connections)
+
+Fetching direct gets Amazon's **"Server Busy"** anti-bot stub (~2.8 KB) instead of the
+product page — measured at roughly a 75% block rate. An **Australian residential
+proxy** fixes both that and the delivery geography in one go.
+
+Set the credentials as an environment variable so they never touch this repo:
+
+```bash
+export SHIPPING_PROXY_URL='http://USER:PASS@gate.decodo.com:7000'
+python3 run_shipping_enrichment.py --live --limit 20 --delay-seconds 5
+```
+
+Use an **AU exit**. Decodo encodes that in the username (e.g. `user-XXXX-country-au`)
+— check your dashboard for the exact syntax. A sticky/session exit is better than
+per-request rotation: the delivery-location cookie is tied to the IP that set it.
+
+The run aborts itself if things go wrong, so a bad proxy can't burn the whole list:
+
+| Guard | Default | Flag |
+|---|---|---|
+| Block rate too high | abort above 30% (after 10 fetches) | `--max-block-rate` |
+| Proxy rejects credentials (407) | abort after 3 | `--max-proxy-auth-failures` |
+
+Aborts are not silent: partial results are still written, `summary.json` records
+`aborted_reason`, and `--resume` picks up where it stopped. Credentials are scrubbed
+from all logs and output.
 
 ## 3. Where the results go
 
