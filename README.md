@@ -75,6 +75,20 @@ The run aborts itself if things go wrong, so a bad proxy can't burn the whole li
 |---|---|---|
 | Block rate too high | abort above 30% (after 10 fetches) | `--max-block-rate` |
 | Proxy rejects credentials (407) | abort after 3 | `--max-proxy-auth-failures` |
+| Wrong country delivery context | abort after 3 non-AU pages | `--max-non-au-pages` |
+
+**When the credentials arrive**, validate in this order — each step is cheap and
+catches a different failure:
+
+```bash
+export SHIPPING_PROXY_URL='http://USER:PASS@HOST:PORT'
+python3 run_shipping_enrichment.py --asin B0CP4XY9QC --live --limit 1   # 1) does it connect?
+python3 run_shipping_enrichment.py --live --limit 20 --delay-seconds 5  # 2) block rate + AU context
+```
+
+After step 2, check `summary.json`: `block_rate` should be near 0 and
+`non_au_delivery_pages` should be 0. If `delivery_location` on the rows says
+`2000`, you're good to raise `--limit`.
 
 Aborts are not silent: partial results are still written, `summary.json` records
 `aborted_reason`, and `--resume` picks up where it stopped. Credentials are scrubbed

@@ -94,8 +94,16 @@ SHEET_FOR_STATUS = {
     "unsupported_layout": "errors",
     "fetch_failed": "errors",
     "parse_error": "errors",
+    "run_aborted": "errors",
 }
 DATA_SHEETS = ["extracted", "redirects", "no_required_data", "errors"]
+
+# Transient infrastructure faults. These are never checkpointed, so --resume
+# retries them once the underlying cause (proxy, throttling, network) is fixed.
+# Deterministic failures like parse_error are NOT here: retrying can't help.
+_RETRYABLE_STATUSES = frozenset({
+    "proxy_auth_failed", "fetch_failed", "server_busy", "timeout", "run_aborted",
+})
 
 
 # --------------------------------------------------------------------------
@@ -1128,6 +1136,17 @@ def _trip_if_unhealthy(live_state, live_cfg, log):
                 "stopping so the rest of the list isn't wasted"
                 % (rate * 100, done, live_cfg["max_block_rate"] * 100))
 
+    # Wrong-country delivery context. Observed today: the location setup can
+    # report success while Amazon still serves a foreign delivery context, and
+    # every ETA/fee gathered that way is unusable. Catch it on the first pages
+    # instead of after the whole list has been fetched.
+    non_au = live_state["non_au_pages"]
+    if non_au >= live_cfg["max_non_au_pages"]:
+        raise RunAborted(
+            "%d pages came back with a non-Australian delivery context - ETA and delivery "
+            "fee would be for the wrong country. Check the proxy is exiting in Australia."
+            % non_au)
+
 
 def classify(unit_key, fixtures_dir, cache_dir, live_cfg, live_state,
              rendered_cache_dir, browser_cfg, browser_state, log, retention=None):
@@ -1260,7 +1279,11 @@ def classify(unit_key, fixtures_dir, cache_dir, live_cfg, live_state,
             # the success path and is released when this frame returns.
             result = parse_html(html_text, unit_key, log)
             log("live classify %s -> %s" % (unit_key, result.get("status")))
+            basis = result.get("delivery_location_basis", "")
+            if basis and not re.search(r"australia|\b\d{4}\b", basis, re.IGNORECASE):
+                live_state["non_au_pages"] += 1
 
+        _trip_if_unhealthy(live_state, live_cfg, log)
         _retain_html(html_text, unit_key, result, cache_dir, retention, log)
         return result
 
@@ -1315,9 +1338,15 @@ def load_completed_asins(run_dir, log):
     A truncated final line (process killed mid-write) is skipped rather than
     treated as corruption - that record simply gets redone.
     """
+    if not os.path.isdir(run_dir):
+        raise SystemExit("--resume: no such run folder: %s" % run_dir)
     path = os.path.join(run_dir, "progress.jsonl")
     if not os.path.exists(path):
-        raise SystemExit("--resume: no progress.jsonl in %s" % run_dir)
+        # A run in which nothing completed (e.g. the proxy was down throughout)
+        # writes no checkpoint. That means everything is still pending, which is
+        # a normal thing to resume from - not an error.
+        log("--resume: %s has no completed ASINs; the whole list is still pending" % run_dir)
+        return set()
     done = set()
     with open(path, encoding="utf-8") as fh:
         for line in fh:
@@ -1347,6 +1376,13 @@ def build_records(units, rejected, extracted_at, fixtures_dir, cache_dir, live_c
     def checkpoint(asin, result):
         if not progress_path:
             return
+        # Only record outcomes that are genuinely settled. Infrastructure faults
+        # (proxy down, blocked by Amazon, timeout) say nothing about the product
+        # and must stay eligible for --resume once the cause is fixed. Recording
+        # them would be worst at the worst time: at a 75% block rate it would
+        # permanently skip three quarters of the list.
+        if result.get("status") in _RETRYABLE_STATUSES:
+            return
         try:
             with open(progress_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"asin": asin, "status": result.get("status", ""),
@@ -1360,18 +1396,27 @@ def build_records(units, rejected, extracted_at, fixtures_dir, cache_dir, live_c
         order[id(rec)] = row["input_row_number"]
         records.append(rec)
 
-    for key, member_rows in units.items():
+    pending = list(units.items())
+    for index, (key, member_rows) in enumerate(pending):
         try:
             result = classify(key, fixtures_dir, cache_dir, live_cfg, live_state,
                               rendered_cache_dir, browser_cfg, browser_state, log, retention)
         except RunAborted as exc:
-            # Stop fetching, but keep everything already extracted: the partial
-            # results are written normally and progress.jsonl lets --resume pick
-            # up from here once the cause is fixed.
+            # Stop fetching, but do NOT drop the rest of the list: every
+            # remaining input row still gets a record saying why it wasn't
+            # processed, so the counts reconcile and nothing vanishes. These
+            # units are deliberately NOT checkpointed, so --resume retries them.
             log("ABORTED: %s" % exc)
             log("stopping after %d fetches - results so far are still written"
                 % live_state.get("fetches_done", 0))
             live_state["aborted"] = str(exc)
+            for _, remaining_rows in pending[index:]:
+                for row in remaining_rows:
+                    rec = project_to_output(
+                        row, {"status": "run_aborted", "reason": "not_processed: %s" % exc},
+                        extracted_at)
+                    order[id(rec)] = row["input_row_number"]
+                    records.append(rec)
             break
         for row in member_rows:
             rec = project_to_output(row, result, extracted_at)
@@ -1604,6 +1649,10 @@ def main(argv=None):
                              "(default: 10)")
     parser.add_argument("--max-proxy-auth-failures", type=int, default=3,
                         help="abort after this many 407s from the proxy (default: 3)")
+    parser.add_argument("--max-non-au-pages", type=int, default=3,
+                        help="abort after this many pages served with a non-Australian "
+                             "delivery context - their ETA/fee would be for the wrong "
+                             "country (default: 3)")
     parser.add_argument("--au-postcode", default="2000",
                         help="Australian delivery postcode to establish once per run, so ETA and "
                              "delivery fee are computed for Australia even when the tool runs "
@@ -1638,6 +1687,7 @@ def main(argv=None):
             "max_block_rate": args.max_block_rate,
             "block_rate_min_samples": args.block_rate_min_samples,
             "max_proxy_auth_failures": args.max_proxy_auth_failures,
+            "max_non_au_pages": args.max_non_au_pages,
         }
 
     browser_cfg = None
@@ -1705,8 +1755,9 @@ def main(argv=None):
                browser_cfg["delay_seconds"], browser_cfg["timeout_seconds"]))
         log("fixtures: (not consulted in --browser-live mode)")
     elif live_cfg is not None:
-        log("LIVE MODE - direct fetch enabled. No proxy, no Decodo, no concurrency. "
-            "limit=%d delay=%.1fs timeout=%.1fs"
+        log("LIVE MODE - %s, no concurrency. "
+            % ("via proxy %s" % PROXY_STATE["host"] if PROXY_STATE["configured"] else "direct, no proxy")
+            + "limit=%d delay=%.1fs timeout=%.1fs"
             % (live_cfg["limit"], live_cfg["delay_seconds"], live_cfg["timeout_seconds"]))
         log("fixtures: (not consulted in --live mode)")
     else:
@@ -1773,7 +1824,7 @@ def main(argv=None):
 
     extracted_at = started.replace(microsecond=0).isoformat()
     live_state = {"fetches_done": 0, "wire_bytes": 0, "blocked": 0,
-                  "proxy_auth_failures": 0, "aborted": None}
+                  "proxy_auth_failures": 0, "non_au_pages": 0, "aborted": None}
     browser_state = {"fetches_done": 0, "served_hosts": {}}
     progress_path = os.path.join(run_dir, "progress.jsonl")
     records = build_records(units, rejected, extracted_at, fixtures_dir, cache_dir, live_cfg, live_state,
@@ -1876,6 +1927,7 @@ def main(argv=None):
         ("proxy_used", PROXY_STATE["configured"]),
         ("proxy_endpoint", PROXY_STATE["host"]),
         ("blocked_by_amazon", live_state["blocked"]),
+        ("non_au_delivery_pages", live_state["non_au_pages"]),
         ("proxy_auth_failures", live_state["proxy_auth_failures"]),
         ("block_rate", round(live_state["blocked"] / live_state["fetches_done"], 3)
          if live_state["fetches_done"] else None),
