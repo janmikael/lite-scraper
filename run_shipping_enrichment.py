@@ -136,7 +136,15 @@ def load_input(path, log):
 
         row_number = 0
         for raw in reader:
-            values = [(v or "").strip() for v in raw.values()]
+            # An unquoted comma in `title` gives DictReader a surplus field,
+            # which it stores as a LIST under the None restkey. Calling .strip()
+            # on that list used to abort the whole run before any output.
+            values = []
+            for value in raw.values():
+                if isinstance(value, list):
+                    values.extend((item or "").strip() for item in value)
+                else:
+                    values.append((value or "").strip())
             if not any(values):
                 blank_skipped += 1
                 continue
@@ -291,7 +299,16 @@ _DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
 _ETA_DATE_RE = re.compile(
     r'\b(%s),?\s+(\d{1,2})\s+(%s)\b' % ("|".join(_DAY_NAMES), "|".join(_MONTHS))
 )
-_FEE_RE = re.compile(r'\$\s?(\d+(?:\.\d{1,2})?)')
+_FEE_RE = re.compile(r'\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)')
+
+# The delivery CLAUSE, not just any money or any "free" on the page. Amazon puts
+# "FREE Returns", Prime upsells and "free delivery on orders over $59" in the same
+# block, so matching them loosely turned paid delivery into 0.00 - an error in the
+# most expensive possible direction. Whichever clause appears FIRST wins, because
+# the actual offer for this item leads the block.
+_FEE_CLAUSE_RE = re.compile(
+    r'(?:\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)|\b(free)\b)'
+    r'[^.$]{0,20}?\b(?:delivery|shipping|dispatch)\b', re.IGNORECASE)
 
 
 def extract_canonical_asin(html_text):
@@ -350,8 +367,18 @@ def _collapse_repeat(text):
         if n % size:
             continue
         chunk = words[:size]
-        if all(words[i:i + size] == chunk for i in range(0, n, size)):
+        if not all(words[i:i + size] == chunk for i in range(0, n, size)):
+            continue
+        repeats = n // size
+        # Amazon emits the value 2x (visible + truncation popover) or 3x (plus
+        # the popover's own label+value). Collapse those. But a single word
+        # repeated exactly twice is indistinguishable from a real business name
+        # - "Mega Mega", "Tom Tom" - so leave that alone rather than silently
+        # halving a merchant's identity. 3x of one word is still Amazon's
+        # pattern ("YARRAMATE YARRAMATE YARRAMATE"), so that does collapse.
+        if repeats >= 3 or size >= 2:
             return " ".join(chunk)
+        return text
     return text
 
 
@@ -444,18 +471,18 @@ def parse_delivery(html_text):
 
     result = {"delivery_message_raw": raw}
 
-    if re.search(r"\bfree\b", raw, re.IGNORECASE):
-        # FREE delivery is a fee of 0, not "unknown". See CLAUDE.md: blank is not zero,
-        # and the inverse matters just as much - zero must not become blank.
-        result["delivery_fee"] = 0.0
+    # FREE delivery is a fee of 0, not "unknown". See CLAUDE.md: blank is not
+    # zero, and the inverse matters just as much - zero must not become blank.
+    clause = _FEE_CLAUSE_RE.search(raw)
+    if clause:
+        amount, free_word = clause.group(1), clause.group(2)
+        if amount:
+            result["delivery_fee"] = float(amount.replace(",", ""))
+        elif free_word:
+            result["delivery_fee"] = 0.0
         result["delivery_fee_currency"] = "AUD"
-    else:
-        fee_match = _FEE_RE.search(raw)
-        if fee_match:
-            result["delivery_fee"] = float(fee_match.group(1))
-            result["delivery_fee_currency"] = "AUD"
-        # else: no unambiguous fee in the text. Leave delivery_fee/currency unset,
-        # which build_records() renders as blank - never invent a number.
+    # else: no unambiguous delivery fee in the text. Leave delivery_fee/currency
+    # unset, which project_to_output() renders as blank - never invent a number.
 
     eta_date = normalise_eta_date(raw)
     if eta_date:
@@ -498,8 +525,15 @@ def _resolve_future_date(day, month, today=None):
             candidate = dt.date(year, month, day)
         except ValueError:
             continue
-        if candidate >= today:
-            return candidate
+        # Small backward slack: Amazon may still be rendering the previous AU
+        # day, and a cached page can be reparsed a day later. Without it, a date
+        # a couple of days past silently resolved a YEAR forward - and since
+        # normalise_eta_date() takes max(), one stale component poisoned the
+        # whole answer ("14 - 18 August" -> 2027-08-14).
+        if candidate >= today - dt.timedelta(days=3):
+            # Past ~6 months this is not a delivery estimate. Blank beats
+            # confidently wrong.
+            return candidate if (candidate - today).days <= 180 else None
     return None
 
 
@@ -671,7 +705,7 @@ def parse_html(html_text, requested_asin, log):
             result["reason"] = ""
         return result
     except Exception as exc:  # conservative: never let one bad page crash the run
-        log("fixture parse error for %s: %r" % (path, exc))
+        log("page parse error for %s: %r" % (requested_asin, exc))
         return {"status": "parse_error", "reason": "unexpected_parse_exception:%s" % type(exc).__name__}
 
 
